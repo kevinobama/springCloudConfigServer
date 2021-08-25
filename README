@@ -1,0 +1,222 @@
+1. Overview
+Spring Cloud Config is Spring's client/server approach for storing and serving distributed configurations across multiple applications and environments.
+
+This configuration store is ideally versioned under Git version control and can be modified at application runtime. While it fits very well in Spring applications using all the supported configuration file formats together with constructs like Environment, PropertySource or @Value, it can be used in any environment running any programming language.
+
+In this write-up, we'll focus on an example of how to setup a Git-backed config server, use it in a simple REST application server and setup a secure environment including encrypted property values.
+
+2. Project Setup and Dependencies
+To get ready for writing some code, we create two new Maven projects first. The server project is relying on the spring-cloud-config-server module, as well as the spring-boot-starter-security and spring-boot-starter-web starter bundles:
+
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-config-server</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+However for the client project we're going to only need the spring-cloud-starter-config and the spring-boot-starter-web modules:
+
+<dependency>
+    <groupId>org.springframework.cloud</groupId>
+    <artifactId>spring-cloud-starter-config</artifactId>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+3. A Config Server Implementation
+The main part of the application is a config class – more specifically a @SpringBootApplication – which pulls in all the required setup through the auto-configure annotation @EnableConfigServer:
+
+@SpringBootApplication
+@EnableConfigServer
+public class ConfigServer {
+    
+    public static void main(String[] arguments) {
+        SpringApplication.run(ConfigServer.class, arguments);
+    }
+}
+Now we need to configure the server port on which our server is listening and a Git-url which provides our version-controlled configuration content. The latter can be used with protocols like http, ssh or a simple file on a local filesystem.
+
+Tip: If you are planning to use multiple config server instances pointing to the same config repository, you can configure the server to clone your repo into a local temporary folder. But be aware of private repositories with two-factor authentication, they are difficult to handle! In such a case, it is easier to clone them on your local filesystem and work with the copy.
+
+There are also some placeholder variables and search patterns for configuring the repository-url available; but this is beyond the scope of our article. If you are interested, the official documentation is a good place to start.
+
+We also need to set a username and a password for the Basic-Authentication in our application.properties to avoid an auto-generated password on every application restart:
+
+server.port=8888
+spring.cloud.config.server.git.uri=ssh://localhost/config-repo
+spring.cloud.config.server.git.clone-on-start=true
+spring.security.user.name=root
+spring.security.user.password=s3cr3t
+4. A Git Repository as Configuration Storage
+To complete our server, we have to initialize a Git repository under the configured url, create some new properties files and popularize them with some values.
+
+The name of the configuration file is composed like a normal Spring application.properties, but instead of the word ‘application' a configured name, e.g. the value of the property ‘spring.application.name' of the client is used, followed by a dash and the active profile. For example:
+
+$> git init
+$> echo 'user.role=Developer' > config-client-development.properties
+$> echo 'user.role=User'      > config-client-production.properties
+$> git add .
+$> git commit -m 'Initial config-client properties'
+Troubleshooting: If you run into ssh-related authentication issues, double check ~/.ssh/known_hosts and ~/.ssh/authorized_keys on your ssh server!
+
+5. Querying the Configuration
+Now we're able to start our server. The Git-backed configuration API provided by our server can be queried using the following paths:
+
+/{application}/{profile}[/{label}]
+/{application}-{profile}.yml
+/{label}/{application}-{profile}.yml
+/{application}-{profile}.properties
+/{label}/{application}-{profile}.properties
+In which the {label} placeholder refers to a Git branch, {application} to the client's application name and the {profile} to the client's current active application profile.
+
+So we can retrieve the configuration for our planned config client running under development profile in branch master via:
+
+$> curl http://root:s3cr3t@localhost:8888/config-client/development/master
+6. The Client Implementation
+Next, let's take care of the client. This will be a very simple client application, consisting of a REST controller with one GET method.
+
+The configuration, to fetch our server, must be placed in a resource file named bootstrap.application, because this file (like the name implies) will be loaded very early while the application starts:
+
+@SpringBootApplication
+@RestController
+public class ConfigClient {
+    
+    @Value("${user.role}")
+    private String role;
+
+    public static void main(String[] args) {
+        SpringApplication.run(ConfigClient.class, args);
+    }
+
+    @GetMapping(
+      value = "/whoami/{username}",  
+      produces = MediaType.TEXT_PLAIN_VALUE)
+    public String whoami(@PathVariable("username") String username) {
+        return String.format("Hello! 
+          You're %s and you'll become a(n) %s...\n", username, role);
+    }
+}
+In addition to the application name, we also put the active profile and the connection-details in our bootstrap.properties:
+
+spring.application.name=config-client
+spring.profiles.active=development
+spring.cloud.config.uri=http://localhost:8888
+spring.cloud.config.username=root
+spring.cloud.config.password=s3cr3t
+To test, if the configuration is properly received from our server and the role value gets injected in our controller method, we simply curl it after booting the client:
+
+$> curl http://localhost:8080/whoami/Mr_Pink
+If the response is as follows, our Spring Cloud Config Server and its client are working fine for now:
+
+Hello! You're Mr_Pink and you'll become a(n) Developer...
+7. Encryption and Decryption
+Requirement: To use cryptographically strong keys together with Spring encryption and decryption features you need the ‘Java Cryptography Extension (JCE) Unlimited Strength Jurisdiction Policy Files' installed in your JVM. These can be downloaded for example from Oracle. To install follow the instructions included in the download. Some Linux distributions also provide an installable package through their package managers.
+
+Since the config server is supporting encryption and decryption of property values, you can use public repositories as storage for sensitive data like usernames and passwords. Encrypted values are prefixed with the string {cipher} and can be generated by an REST-call to the path ‘/encrypt', if the server is configured to use a symmetric key or a key pair.
+
+An endpoint to decrypt is also available. Both endpoints accept a path containing placeholders for the name of the application and its current profile: ‘/*/{name}/{profile}'. This is especially useful for controlling cryptography per client. However, before they become useful, you have to configure a cryptographic key which we will do in the next section.
+
+Tip: If you use curl to call the en-/decryption API, it's better to use the –data-urlencode option (instead of –data/-d), or set the ‘Content-Type' header explicit to ‘text/plain'. This ensures a correct handling of special characters like ‘+' in the encrypted values.
+
+If a value can't be decrypted automatically while fetching through the client, its key is renamed with the name itself, prefixed by the word ‘invalid'. This should prevent, for example the usage of an encrypted value as password.
+
+Tip: When setting-up a repository containing YAML files, you have to surround your encrypted and prefixed values with single-quotes! With Properties this is not the case.
+
+7.1. CSRF
+By default Spring Security enables CSRF protection for all the requests sent to our application.
+
+Therefore, to be able to use the /encrypt and /decrypt endpoints, let's disable the CSRF for them:
+
+@Configuration
+public class SecurityConfiguration extends WebSecurityConfigurerAdapter {
+
+    @Override
+    public void configure(HttpSecurity http) throws Exception {
+        http.csrf()
+          .ignoringAntMatchers("/encrypt/**")
+          .ignoringAntMatchers("/decrypt/**");
+
+        super.configure(http);
+    }
+}
+7.2. Key Management
+The config server is per default enabled to encrypt property values in a symmetric or asymmetric way.
+
+To use symmetric cryptography, you simply have to set the property ‘encrypt.key' in your application.properties to a secret of your choice. Alternatively you can pass-in the environment variable ENCRYPT_KEY.
+
+For asymmetric cryptography, you can set ‘encrypt.key' to a PEM-encoded string value or configure a keystore to use.
+
+Because we need a highly secured environment for our demo server, we chose the latter option and generating a new keystore, including a RSA key-pair, with the Java keytool first:
+
+$> keytool -genkeypair -alias config-server-key \
+       -keyalg RSA -keysize 4096 -sigalg SHA512withRSA \
+       -dname 'CN=Config Server,OU=Spring Cloud,O=Baeldung' \
+       -keypass my-k34-s3cr3t -keystore config-server.jks \
+       -storepass my-s70r3-s3cr3t
+After that, we're adding the created keystore to our server's bootstrap.properties and re-run it:
+
+encrypt.keyStore.location=classpath:/config-server.jks
+encrypt.keyStore.password=my-s70r3-s3cr3t
+encrypt.keyStore.alias=config-server-key
+encrypt.keyStore.secret=my-k34-s3cr3t
+As next step we can query the encryption-endpoint and add the response as value to a configuration in our repository:
+
+$> export PASSWORD=$(curl -X POST --data-urlencode d3v3L \
+       http://root:s3cr3t@localhost:8888/encrypt)
+$> echo "user.password={cipher}$PASSWORD" >> config-client-development.properties
+$> git commit -am 'Added encrypted password'
+$> curl -X POST http://root:s3cr3t@localhost:8888/refresh
+To test, if our setup works correctly, we're modifying the ConfigClient class and restart our client:
+
+@SpringBootApplication
+@RestController
+public class ConfigClient {
+
+    ...
+    
+    @Value("${user.password}")
+    private String password;
+
+    ...
+    public String whoami(@PathVariable("username") String username) {
+        return String.format("Hello! 
+          You're %s and you'll become a(n) %s, " +
+          "but only if your password is '%s'!\n", 
+          username, role, password);
+    }
+}
+A final query against our client will show us, if our configuration value is being correct decrypted:
+
+$> curl http://localhost:8080/whoami/Mr_Pink
+Hello! You're Mr_Pink and you'll become a(n) Developer, \
+  but only if your password is 'd3v3L'!
+7.3. Using Multiple Keys
+If you want to use multiple keys for encryption and decryption, for example: a dedicated one for each served application, you can add another prefix in the form of {name:value} between the {cipher} prefix and the BASE64-encoded property value.
+
+The config server understands prefixes like {secret:my-crypto-secret} or {key:my-key-alias} nearly out-of-the-box. The latter option needs a configured keystore in your application.properties. This keystore is searched for a matching key alias. For example:
+
+user.password={cipher}{secret:my-499-s3cr3t}AgAMirj1DkQC0WjRv...
+user.password={cipher}{key:config-client-key}AgAMirj1DkQC0WjRv...
+For scenarios without keystore you have to implement a @Bean of type TextEncryptorLocator which handles the lookup and returns a TextEncryptor-Object for each key.
+
+7.4. Serving Encrypted Properties
+If you want to disable server-side cryptography and handle decryption of property-values locally, you can put the following in your server's application.properties:
+
+spring.cloud.config.server.encrypt.enabled=false
+Furthermore you can delete all the other ‘encrypt.*' properties to disable the REST endpoints.
+
+you can open this link to see the file: http://localhost:8888/config-client-development.properties
+you can do this as your local git repo: spring.cloud.config.server.git.uri=file://${user.home}/config-repo
+
+good articles:
+https://www.thomasvitale.com/spring-cloud-config-basics/#:~:text=%20Centralized%20Configuration%20with%20Spring%20Cloud%20Config%20,section%2C%20we%27re%20going%20to%20build%20a...%20More%20
+https://www.baeldung.com/spring-cloud-configuration
+
+
